@@ -2,7 +2,10 @@
 # ============================================================
 # WorkBuddy 每日积分签到（通用版，可分发）
 #
-# 流程：读取本地令牌 → 查询签到状态 → 未签到则领取 → 写日志
+# 流程（v1.0.5）：
+#   通道A（优先）：wbipc 通道 —— 桌面端运行中即可签到（wbipc-checkin.js 经桌面端
+#     内置 broker 转发请求，鉴权由桌面端注入，无需本地令牌；支持个人账号加密登录态）
+#   通道B（回退）：读取本地令牌 → 查询签到状态 → 未签到则领取 → 写日志
 # 用法：
 #   ./checkin.sh                      # 自动探测运行时（Node 优先，Electron 回退）
 #   WB_CHECKIN_NODE=<path> ./checkin.sh
@@ -12,10 +15,11 @@
 #   0 9 * * * /path/to/checkin.sh >> /path/to/logs/checkin.log 2>&1
 #
 # 运行时策略：
-#   - 优先用 Node 读取 v5.3.8+ 的新版明文登录态（无需 Electron）。
+#   - wbipc 通道与读取 v5.3.8+ 新版明文登录态都优先用 Node。
 #   - 新版明文文件缺失时，回退到 Electron + safeStorage 解密旧版 state.vscdb。
 #
 # ⚠️ 凭据安全提示：
+#   - wbipc 通道不接触任何令牌（鉴权头由桌面端主进程注入，ticket 只做 HMAC 不上线）。
 #   - 本地令牌（accessToken）等同 WorkBuddy 账号密码，仅在本脚本内存中使用，
 #     通过管道立即消费，不写入日志、不落地、不回显。
 #   - 日志（logs/checkin.log）只记录签到结果（积分/连续天数），不含令牌。
@@ -71,6 +75,43 @@ find_electron() {
   echo ""
 }
 
+# ---------- 通道A：wbipc（v1.0.5 新增，优先） ----------
+# 桌面端运行中即走此通道：请求经桌面端内置 wbipc broker 转发，鉴权头由桌面端注入
+# （当前登录账号，含被加密保护的个人账号），本脚本全程接触不到令牌。
+try_wbipc() {
+  local wbipc_js="$SCRIPT_DIR/wbipc-checkin.js"
+  local cfg_dir="${WORKBUDDY_CONFIG_DIR:-$HOME/.workbuddy}"
+  local ep_file="$cfg_dir/wbipc/endpoint.json"
+  local node_bin
+  node_bin="$(find_node)"
+  [ -n "$node_bin" ] && [ -f "$wbipc_js" ] && [ -f "$ep_file" ] || return 1
+  local line
+  line="$("$node_bin" "$wbipc_js" 2>/dev/null | grep -m1 "^WBIPC_")"
+  case "$line" in
+    WBIPC_RESULT=OK*)
+      local credit streak
+      credit="$(echo "$line" | sed -n 's/.*credit=\([0-9]*\).*/\1/p')"
+      streak="$(echo "$line" | sed -n 's/.*streak_days=\([0-9]*\).*/\1/p')"
+      log "签到成功！领取 credit=${credit:-?} streak_days=${streak:-?}（wbipc 通道）"
+      exit 0 ;;
+    WBIPC_RESULT=ALREADY)
+      log "今日已签到，无需重复领取（wbipc 通道）"
+      exit 0 ;;
+    WBIPC_RESULT=FAIL*)
+      if echo "$line" | grep -q "企业账号"; then
+        log "签到未成功：该账号不支持签到活动（桌面端当前登录为企业账号，Buddy 加油站签到仅限个人账号；请在桌面端切换个人账号后重试）"
+      else
+        log "签到未成功：$line"
+      fi
+      exit 1 ;;
+    *)
+      # WBIPC_ERROR=* / 空 → 通道不可用，回退通道B
+      log "wbipc 通道不可用（${line:-无输出}），回退本地令牌通道"
+      return 1 ;;
+  esac
+}
+
+# ---------- 通道B：本地令牌（v1.0.4 及以前的主路径） ----------
 # ---------- 读取令牌：Node 优先，Electron 回退 ----------
 read_token() {
   local out="" node_bin electron_bin
@@ -103,6 +144,9 @@ if [ "${WB_CHECKIN_JITTER:-0}" -gt 0 ] 2>/dev/null; then
   jitter=$((RANDOM % WB_CHECKIN_JITTER))
   [ "$jitter" -gt 0 ] && sleep "$jitter"
 fi
+
+# ---------- 执行：先试 wbipc 通道，失败自动落回通道B ----------
+try_wbipc || true
 
 # ---------- 1. 读取令牌 ----------
 TOKEN="$(read_token)"

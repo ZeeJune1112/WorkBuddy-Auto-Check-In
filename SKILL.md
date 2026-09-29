@@ -1,30 +1,47 @@
 ---
 name: workbuddy-checkin
-description: WorkBuddy 每日积分自动签到。自动解密本地登录令牌，调用官方签到 API 完成每日积分领取（100 积分/天，连续第 7 天 1000 积分），并支持配置定时任务。触发词：WorkBuddy 签到、每日积分、check-in、credits。
-version: "1.0.3"
+description: WorkBuddy 每日积分自动签到。优先走 wbipc 通道（桌面端运行中即可签到，无需本地令牌，支持个人账号加密登录态）；回退本地明文令牌调用官方签到 API。每日 100 积分，连续第 7 天 1000 积分，支持定时任务。触发词：WorkBuddy 签到、每日积分、check-in、credits。
+version: "1.0.5"
 license: MIT
 ---
 
 # WorkBuddy 每日积分签到
 
 自动领取 WorkBuddy 每日积分（100 积分/天，连续第 7 天 1000 积分）。
-全流程在本机完成：读取本地登录态 → 调用腾讯官方签到接口。无后端服务。
+全流程在本机完成：wbipc 通道（优先）或读取本地登录态 → 调用腾讯官方签到接口。无后端服务。
 
 ## 原理
+
+**通道A（v1.0.5 优先）：wbipc 通道 —— 无需任何本地令牌**
+
+桌面端主进程内置 wbipc broker（named pipe），提供 `wb.request` 管道的 `http.fetch` 方法：
+脚本只传相对路径，桌面端自动注入**当前登录账号**的鉴权头（Authorization / X-User-Id）
+后转发到官方后端。因此：
+
+- **个人账号令牌即使被新版 `$wbEncrypted` 字段级加密保护也能签到**（1.0.4 时代无解的问题）；
+- 脚本全程接触不到令牌（ticket 只做 HMAC 握手、从不上线），凭据安全面反而更小；
+- 前提：桌面端正在运行且已登录（发现文件 `<configDir>/wbipc/endpoint.json` 存在）。
+
+协议细节与 Windows named pipe 连接后需延迟 ~250ms 再写（否则随机 EPIPE）的实测坑，
+见 `scripts/wbipc-checkin.js` 头注释与 CHANGELOG 1.0.5。
+
+**通道B（回退）：本地明文令牌**
 
 1. WorkBuddy 桌面端登录后，会在本地保存登录态。**v5.3.8+ 的新版桌面端**改为明文 JSON 文件：
    - macOS：`~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info`
    - 结构 `{ account, auth: { accessToken, refreshToken, expiresAt, ... }, accounts }`，桌面端临近过期会自动刷新，纯 Node 即可读取 `auth.accessToken`。
+   - ⚠️ 2026-09 起主文件 accessToken 已改为 `$wbEncrypted` 加密信封（详见 CHANGELOG 1.0.4），个人账号明文不再可得——此场景请确保走通道A。
 2. **旧版 WorkBuddy/CodeBuddy** 仍把 auth session 用 Electron `safeStorage` 加密存于 `state.vscdb`；新版明文文件缺失时回退到此路径，用 Electron 运行时执行 `safeStorage.decryptString()` 解密（macOS 命中钥匙串；Windows/Linux 走 DPAPI/keyring）。
-3. 运行时策略：**Node 优先**（读新版明文文件，无需 Electron），缺失时回退 Electron（解旧版 `state.vscdb`）。
-4. 调用腾讯官方签到 API：
+3. 调用腾讯官方签到 API：
    - 查状态：`POST https://copilot.tencent.com/v2/billing/meter/checkin-status`
    - 执行签到：`POST https://copilot.tencent.com/v2/billing/meter/daily-checkin`
    - 认证：`Authorization: Bearer <accessToken>`，并按桌面端 `buildHeaders` 附带 `X-User-Id: <account.uid>`；有 `auth.domain` 时加 `X-Domain`，企业账号另加 `X-Enterprise-Id` / `X-Tenant-Id`
    - 兼容说明：`checkin.ps1` 走上述 `/v2/` 全量签名（对齐桌面端）；`checkin.sh` 仍走不带 `/v2/` 前缀、仅 `Authorization` 的旧写法。**两种写法实测均返回 200**（见 CHANGELOG 1.0.3 的验证矩阵），网关当前未强制 `/v2/` 或 `X-User-Id`；对齐桌面端属前向兼容加固，不是修复 401 的必要条件
-5. 脚本幂等：先查状态（命中即跳过）；`daily-checkin` 返回 `code=10001`（今天已签到）同样视为成功，避免重复请求被误报为失败。
+4. 脚本幂等：先查状态（命中即跳过）；`daily-checkin` 返回明确"已签到"语义时同样视为成功，避免重复请求被误报为失败。
 
-> ⚠️ v5.3.8 实测 `checkin-status` 的 `today_checked_in` 字段不可靠（签到成功后仍可能为 `false`）。因此幂等性主要靠 `daily-checkin` 的 `code=10001` 兜底。
+> ⚠️ v5.3.8 实测 `checkin-status` 的 `today_checked_in` 字段不可靠（签到成功后仍可能为 `false`）。因此幂等性主要靠 `daily-checkin` 的重复调用兜底。
+
+> ⚠️ **企业账号不支持签到**（1.0.4 实测确认）：无论哪个通道，登录态为企业账号时 `daily-checkin` 返回 `HTTP 400 + code=10001, msg="企业账号不支持该操作"`。**10001 ≠ 今日已签到**。1.0.4 起按响应 `msg` 如实判定：只有 msg 明确含"已签到"才视为幂等跳过，其余如实报错。
 
 兼容旧版应用名 `CodeBuddy`（仅旧版 `state.vscdb` 分支需要，macOS 需设环境变量 `WB_CHECKIN_APP_NAME=CodeBuddy`）。
 
@@ -36,7 +53,8 @@ workbuddy-checkin/
 ├── references/
 │   └── dependencies.md         # 依赖清单与平台差异
 └── scripts/
-    ├── decrypt-token.js        # 解密令牌（跨平台）
+    ├── wbipc-checkin.js        # wbipc 通道客户端（v1.0.5，优先）
+    ├── decrypt-token.js        # 解密令牌（跨平台，通道B）
     ├── checkin.sh              # macOS / Linux / Git Bash
     ├── checkin.ps1             # Windows PowerShell
     ├── setup.sh                # macOS / Linux 一键安装
@@ -172,7 +190,9 @@ Windows PowerShell 执行策略用 `-ExecutionPolicy Bypass`；需 `curl.exe`（
 
 - **「获取令牌失败（未知原因）」/ 未找到本地登录态**：先确认 WorkBuddy 桌面端已登录并打开过至少一次。v5.3.8+ 用户检查 Node.js 是否安装（`node -v`），或用 `WB_CHECKIN_NODE` 指定。
 - **v5.3.8 已登录但仍报令牌失败**：本机 skill 版本过旧（< 1.0.2），不识别新版明文存储；升级到 1.0.2+。
-- **当日重跑提示「签到未成功 / code=10001」**：旧版本（< 1.0.2）未把 `code=10001` 识别为「已签到」；1.0.2+ 会正确报告「今日已签到」。
+- **「签到未成功：该账号不支持签到活动」/ 企业账号（1.0.4 新增判定）**：登录态是企业账号时接口必然拒绝（`code=10001, msg=企业账号不支持该操作`）。Buddy 加油站积分签到仅限**个人账号**。请在 WorkBuddy 桌面端切换/登录个人账号后重试。注意：新版桌面端（2026-09 起）把主登录态文件的 accessToken 用 `$wbEncrypted` 信封加密（AES-256-GCM），纯 Node 无法读取个人账号明文令牌——**1.0.5 起此场景由 wbipc 通道（通道A）解决**，只要桌面端运行中且登录个人账号即可自动签到；仅当 wbipc 不可用回退到通道B时才会读到旧的企业账号明文快照并报 UNSUPPORTED。2026-09-29 已穷尽令牌读取的全部旁路（详见 CHANGELOG 1.0.4），不要再尝试解密/抓取令牌。
+- **「wbipc 通道不可用」并回退通道B**：桌面端未运行、未登录、版本过旧（无 wbipc broker），或 `~/.workbuddy/wbipc/endpoint.json` 缺失。先打开桌面端确认已登录；本条只是降级提示，不是故障。若桌面端明确在运行仍报 NO_BROKER/CONNECT_FAILED，检查 `WORKBUDDY_CONFIG_DIR` 是否指向了非默认配置目录。
+- **当日重跑提示「签到未成功 / code=10001」**：1.0.4 起解析响应 `msg` 区分语义（"企业账号不支持该操作"→ 明确报错；"已签到"→ 幂等跳过）；1.0.2~1.0.3 会把 10001 一律误报为"今日已签到"。
 - **401 令牌过期**：打开 WorkBuddy 刷新登录态，脚本每次运行会重新读取最新 token，次日自动恢复。
 - **偶发「令牌已过期（401）」但次日又正常（< 1.0.3）**：401 判定原为扫响应体子串，响应体里的随机 `requestId` 恰好含 `401` 时会误判（约 0.57%/次），当日签到被跳过且连续签到中断。1.0.3 起改用真实 HTTP 状态码判定。
 - **Windows 已登录却持续 401（< 1.0.3）**：1.0.2 的 win32 候选只探 `%APPDATA%`，而桌面端实际把明文登录态写在 `%LOCALAPPDATA%`；读不到新文件时会回退旧版 `state.vscdb`，取到**过期的历史会话令牌**，表现为「能拿到 token 但接口 401」。1.0.3 起优先探 `%LOCALAPPDATA%`。**排查 401 请先确认令牌来源，而非怀疑请求路径或请求头**（实测网关不强制 `/v2/` 与 `X-User-Id`，见 CHANGELOG 1.0.3）。

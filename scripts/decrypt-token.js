@@ -67,28 +67,50 @@ function emitAndExit(code, line) {
   setTimeout(exitFn, 200);
 }
 
-// 新版明文认证文件候选路径（按平台）
-function desktopAuthFileCandidates() {
+// 新版明文认证文件候选目录（按平台）。返回目录而非单一文件：
+// 新版客户端会把带时间戳的登录态快照（workbuddy-desktop.<ts>...info）与主文件
+// （workbuddy-desktop.info）同目录存放；主文件可能使用 $wbEncrypted 字段加密，
+// 只有快照里才有明文 accessToken，因此必须扫描整个目录。
+function desktopAuthDirs() {
   const home = os.homedir();
   const ap = process.env.APPDATA || "";
   const xdg = process.env.XDG_CONFIG_HOME || path.join(home, ".config");
-  const rel = path.join(
-    "CodeBuddyExtension",
-    "Data",
-    "Public",
-    "auth",
-    "workbuddy-desktop.info",
-  );
+  const rel = path.join("CodeBuddyExtension", "Data", "Public", "auth");
   if (process.platform === "darwin") {
     return [path.join(home, "Library", "Application Support", rel)];
   }
   if (process.platform === "win32") {
     const localAp = process.env.LOCALAPPDATA || "";
-    // 当前 WorkBuddy 桌面端把明文登录态写在 %LOCALAPPDATA%（非 %APPDATA%），
-    // 优先探测 LOCALAPPDATA，缺失时回退 APPDATA，确保 Windows 能读到令牌。
-    return [path.join(localAp, rel), path.join(ap, rel)];
+    // 当前 WorkBuddy 桌面端把登录态写在 %LOCALAPPDATA%（非 %APPDATA%），
+    // 优先探测 LOCALAPPDATA，缺失时回退 APPDATA。
+    return [path.join(localAp, rel), path.join(ap, rel)].filter(Boolean);
   }
   return [path.join(xdg, rel)];
+}
+
+// 列出目录下所有 workbuddy-desktop*.info 文件，按修改时间新→旧排序
+function listAuthInfoFiles() {
+  const files = [];
+  for (const dir of desktopAuthDirs()) {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir);
+    } catch (e) {
+      continue;
+    }
+    for (const name of entries) {
+      if (!name.startsWith("workbuddy-desktop") || !name.endsWith(".info")) continue;
+      const full = path.join(dir, name);
+      try {
+        const m = fs.statSync(full).mtimeMs;
+        files.push({ full, m });
+      } catch (e) {
+        // 竞态：文件刚好被删，忽略
+      }
+    }
+  }
+  files.sort((a, b) => b.m - a.m);
+  return files.map((x) => x.full);
 }
 
 // 旧版 state.vscdb 会话库候选路径（按优先级）
@@ -154,32 +176,64 @@ function toBuffer(parsed) {
 // 主流程：新版明文文件优先，旧版 state.vscdb 回退
 // ============================================================
 
-// 1. 新版明文认证文件（WorkBuddy v5.3.8+，纯 Node 读取，优先）
-// 命中且含 accessToken 即输出；文件缺失 / 无 token / 解析失败均不硬失败，
-// 统一落入下方旧版 state.vscdb 分支兜底（覆盖升级中途、文件写入中等场景）。
-for (const f of desktopAuthFileCandidates()) {
-  if (!fs.existsSync(f)) continue;
-  try {
-    const j = JSON.parse(fs.readFileSync(f, "utf8"));
-    const token = j && j.auth && j.auth.accessToken;
-    if (token && typeof token === "string") {
-      const acct = j && j.account;
-      const authObj = j && j.auth;
-      const uid = acct && acct.uid != null ? String(acct.uid) : "";
-      const domain = authObj && authObj.domain != null ? String(authObj.domain) : "";
-      const eid = acct && acct.enterpriseId != null ? String(acct.enterpriseId) : "";
-      process.stderr.write(
-        "[安全提示] 已从本地登录态读取 accessToken（新版明文存储），仅用于 WorkBuddy 官方签到接口；" +
-        "请勿将其写入日志、分享或提交。\n"
-      );
-      // 额外输出 uid/domain/enterpriseId，供 checkin 脚本拼装 X-User-Id 等鉴权头（逆向自客户端 buildHeaders）
-      emitAndExit(0, "DECRYPT_RESULT:" + token + "\nACCOUNT_UID:" + uid + "\nAUTH_DOMAIN:" + domain + "\nENTERPRISE_ID:" + eid);
+// 递归查找登录态 JSON 中任意位置的 accessToken（兼容 auth.accessToken 与
+// accounts[]/allAccounts[] 等新版嵌套结构），并就近提取 uid/domain/enterpriseId。
+function findTokenRecursive(obj) {
+  let result = null;
+  function walk(o, parent) {
+    if (result) return;
+    if (!o || typeof o !== "object") return;
+    if (Array.isArray(o)) { for (const x of o) walk(x, parent); return; }
+    if (typeof o.accessToken === "string" && o.accessToken.length > 0) {
+      const pick = (src, k) => (src && src[k] != null ? String(src[k]) : "");
+      result = {
+        token: o.accessToken,
+        uid: pick(o, "uid") || pick(parent, "uid"),
+        domain: pick(o, "domain") || pick(parent, "domain"),
+        enterpriseId: pick(o, "enterpriseId") || pick(parent, "enterpriseId"),
+      };
       return;
     }
-    // 文件存在但无 accessToken：落入旧版分支兜底
-  } catch (e) {
-    // 解析失败（文件损坏 / 写入中）：忽略，落入旧版分支兜底
+    for (const k of Object.keys(o)) walk(o[k], o);
   }
+  walk(obj, null);
+  return result;
+}
+
+// 1. 新版明文认证文件（WorkBuddy v5.3.8+，纯 Node 读取，优先）
+// 扫描目录下所有 workbuddy-desktop*.info（含带时间戳快照），对每个文件递归查找
+// 「明文字符串」accessToken，选取有效期（auth.expiresAt）最晚的一个输出。
+// 主文件若使用 $wbEncrypted 字段加密（accessToken 非字符串），自动跳过并回退到快照。
+let best = null; // { token, uid, domain, enterpriseId, exp }
+for (const f of listAuthInfoFiles()) {
+  try {
+    const j = JSON.parse(fs.readFileSync(f, "utf8"));
+    const r = findTokenRecursive(j);
+    if (r && r.token) {
+      const exp = Number(j && j.auth && j.auth.expiresAt) || 0;
+      // 账号字段优先从顶层标准位置提取（account.uid / auth.domain / account.enterpriseId），
+      // 递归就近提取结果仅作兜底（uid 必需，缺了会被网关 401 拒绝）
+      const pick = (src, k) => (src && src[k] != null && src[k] !== "" ? String(src[k]) : "");
+      const uid = pick(j && j.account, "uid") || r.uid;
+      const domain = pick(j && j.auth, "domain") || r.domain;
+      const eid = pick(j && j.account, "enterpriseId") || r.enterpriseId;
+      if (!best || exp > best.exp) {
+        best = { token: r.token, uid, domain, enterpriseId: eid, exp };
+      }
+    }
+    // 文件存在但无明文 accessToken：继续尝试下一个文件
+  } catch (e) {
+    // 解析失败（文件损坏 / 写入中）：忽略
+  }
+}
+if (best) {
+  process.stderr.write(
+    "[安全提示] 已从本地登录态读取 accessToken（新版明文存储），仅用于 WorkBuddy 官方签到接口；" +
+    "请勿将其写入日志、分享或提交。\n"
+  );
+  // 额外输出 uid/domain/enterpriseId，供 checkin 脚本拼装 X-User-Id 等鉴权头（逆向自客户端 buildHeaders）
+  emitAndExit(0, "DECRYPT_RESULT:" + best.token + "\nACCOUNT_UID:" + best.uid + "\nAUTH_DOMAIN:" + best.domain + "\nENTERPRISE_ID:" + best.enterpriseId);
+  return;
 }
 
 // 2. 回退：旧版 state.vscdb + Electron safeStorage

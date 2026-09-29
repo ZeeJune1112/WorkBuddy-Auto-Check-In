@@ -1,7 +1,10 @@
 ﻿# ============================================================
 # WorkBuddy 每日积分签到（Windows PowerShell 版，兼容 PS 5.1）
 #
-# 流程：读取本地令牌 -> 查询签到状态 -> 未签到则领取 -> 写日志
+# 流程（v1.0.5）：
+#   通道A（优先）：wbipc 通道 —— 桌面端运行中即可签到（wbipc-checkin.js 经桌面端
+#     内置 broker 转发请求，鉴权由桌面端注入，无需本地令牌；支持个人账号加密登录态）
+#   通道B（回退）：读取本地明文令牌 -> 查询签到状态 -> 未签到则领取 -> 写日志
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File checkin.ps1
 # 或（显式指定运行时）：
@@ -11,9 +14,10 @@
 # 定时（示例，每天 09:00，管理员或普通用户均可）：
 #   schtasks /Create /TN WorkBuddyDailyCheckin /TR "powershell -ExecutionPolicy Bypass -File C:/path/checkin.ps1" /SC DAILY /ST 09:00 /F
 #
-# 运行时策略：Node 优先（读取 v5.3.8+ 新版明文登录态），缺失时回退到 Electron + safeStorage。
+# 运行时策略：Node 优先（wbipc 通道与读取新版明文登录态都需要），缺失时回退到 Electron + safeStorage。
 #
 # 凭据安全提示：
+#   - wbipc 通道不接触任何令牌（鉴权头由桌面端主进程注入，ticket 只做 HMAC 不上线）。
 #   - 本地令牌（accessToken）等同 WorkBuddy 账号密码，仅在本脚本内存中使用，
 #     通过管道立即消费，不写入日志、不落地、不回显。
 #   - 日志（logs/checkin.log）只记录签到结果（积分/连续天数），不含令牌。
@@ -69,6 +73,46 @@ function Find-Electron {
     return ""
 }
 
+# ---------- 通道A：wbipc（v1.0.5 新增，优先） ----------
+# 桌面端运行中即走此通道：请求经桌面端内置 wbipc broker 转发，鉴权头由桌面端注入
+# （当前登录账号，含被加密保护的个人账号），本脚本全程接触不到令牌。
+# 发现文件缺失/连接失败时自动回退通道B（本地令牌）。
+$WbipcJs = Join-Path $ScriptDir "wbipc-checkin.js"
+$WbipcCfgDir = if ($env:WORKBUDDY_CONFIG_DIR) { $env:WORKBUDDY_CONFIG_DIR } else { Join-Path $env:USERPROFILE ".workbuddy" }
+$WbipcEp = Join-Path $WbipcCfgDir "wbipc\endpoint.json"
+$NodeBin0 = Find-Node
+if ($NodeBin0 -and (Test-Path $WbipcJs) -and (Test-Path $WbipcEp)) {
+    $WbipcLine = ""
+    try {
+        $wbipcOut = & $NodeBin0 $WbipcJs 2>$null
+        foreach ($l in $wbipcOut) {
+            if ($l -match "^WBIPC_(RESULT|ERROR)=") { $WbipcLine = ([string]$l).Trim(); break }
+        }
+    } catch {}
+    if ($WbipcLine -like "WBIPC_RESULT=OK*") {
+        $credit = ""; $streak = ""
+        if ($WbipcLine -match "credit=(\d+)") { $credit = $Matches[1] }
+        if ($WbipcLine -match "streak_days=(\d+)") { $streak = $Matches[1] }
+        Write-Log "签到成功！领取 credit=$credit streak_days=$streak（wbipc 通道）"
+        exit 0
+    }
+    elseif ($WbipcLine -eq "WBIPC_RESULT=ALREADY") {
+        Write-Log "今日已签到，无需重复领取（wbipc 通道）"
+        exit 0
+    }
+    elseif ($WbipcLine -like "WBIPC_RESULT=FAIL*") {
+        if ($WbipcLine -match "企业账号") {
+            Write-Log "签到未成功：该账号不支持签到活动（桌面端当前登录为企业账号，Buddy 加油站签到仅限个人账号；请在桌面端切换个人账号后重试）"
+        } else {
+            Write-Log "签到未成功：$WbipcLine"
+        }
+        exit 1
+    }
+    # WBIPC_ERROR=* / 无输出 → 通道不可用，落到通道B
+    Write-Log "wbipc 通道不可用（$($WbipcLine.Trim())），回退本地令牌通道"
+}
+
+# ---------- 通道B：本地令牌（v1.0.4 及以前的主路径） ----------
 # 1. 读取令牌：Node 优先，Electron 回退
 $Token = ""; $AccUid = ""; $AccDomain = ""; $EntId = ""
 $NodeBin = Find-Node
@@ -163,20 +207,29 @@ if ($HttpCode2 -eq "000") { Write-Log "签到请求失败（网络异常）"; ex
 if ($HttpCode2 -eq "401" -or $HttpCode2 -eq "403") { Write-Log "令牌已过期或无权限（HTTP $HttpCode2），请打开 WorkBuddy 桌面端刷新登录态后重试"; exit 1 }
 if (-not $Result) { Write-Log "签到请求失败（响应为空，HTTP $HttpCode2）"; exit 1 }
 
-# HTTP 400 + 响应体含 code=10001 = 今日已签到（接口幂等拒绝，视为成功）
-# 单独前置判断，避免 ConvertFrom-Json 解析 400 响应偶发异常导致误报失败
-if ($HttpCode2 -eq "400" -and $Result -match "10001") {
-    Write-Log "今日已签到，无需重复领取（接口返回已签到）"; exit 0
-}
-
+# 业务错误处理（v1.0.4 修正）：
+# 实测（2026-09-29）daily-checkin 返回 HTTP 400 + code=10001 时 msg="企业账号不支持该操作"。
+# 10001 的真实语义是「企业账号不支持」，不是「今日已签到」——旧版把它误判为已签到，
+# 导致企业账号用户每天被误报"签到正常"，实际从未领取。
+# 处理：解析 code/msg 如实报告；仅在 msg 明确含"已签到"时才视为幂等跳过。
 $Credit = ""
 try {
     $d = $Result | ConvertFrom-Json
+    $codeStr = [string]$d.code
+    $msgStr = ""
+    if ($d.msg) { $msgStr = [string]$d.msg }
     if ($d.code -eq 0) { $Credit = "OK credit=$($d.data.credit) streak_days=$($d.data.streak_days)" }
-    elseif ($d.code -eq 10001) { $Credit = "ALREADY today" }   # 当日已签到：接口幂等拒绝，视为成功
-    else { $Credit = "FAIL code=$($d.code) msg=$($d.msg)" }
-} catch { $Credit = "PARSE_ERR" }
+    elseif ($msgStr -match "已签到|already.{0,20}checked|checked.{0,20}in") { $Credit = "ALREADY today" }
+    elseif ($codeStr -eq "10001" -or $msgStr -match "企业账号") {
+        $EntHint = ""
+        if ($EntId) { $EntHint = "（当前登录态为企业账号，Buddy 加油站签到仅限个人账号；请在 WorkBuddy 桌面端使用个人账号登录后重试）" }
+        else { $EntHint = "（msg=$msgStr）" }
+        $Credit = "UNSUPPORTED$EntHint"
+    }
+    else { $Credit = "FAIL code=$codeStr msg=$msgStr" }
+} catch { $Credit = "PARSE_ERR raw=$($Result.Substring(0, [Math]::Min(120, $Result.Length)))" }
 
 if ($Credit -like "OK*") { Write-Log "签到成功！领取 $Credit" }
 elseif ($Credit -like "ALREADY*") { Write-Log "今日已签到，无需重复领取（接口返回已签到）" }
+elseif ($Credit -like "UNSUPPORTED*") { Write-Log "签到未成功：该账号不支持签到活动 $Credit" }
 else { Write-Log ("签到未成功：" + $Credit) }

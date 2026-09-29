@@ -1,5 +1,51 @@
 # 变更日志
 
+## [1.0.5] - 2026-09-29
+
+### 新增
+
+- **wbipc 通道（通道A）：桌面端运行中即可自动签到，彻底解决"个人账号令牌被 `$wbEncrypted` 加密导致无法自动签到"的问题**（`scripts/wbipc-checkin.js` 新增；`checkin.ps1` / `checkin.sh` 集成，wbipc 优先、失败自动回退本地令牌路径）：
+  - **原理**（逆向自桌面端 5.6.2 `main/server.js` 的 `packages/workbuddy-server/src/wbipc/*`）：桌面端主进程内置 wbipc broker（Windows named pipe `\\.\pipe\wbipc-<id>` / unix socket），对外提供 `wb.request` 管道的 `http.fetch` 方法。调用方只传相对路径 + method + body，**服务端自动注入当前登录账号的鉴权头**（`Authorization: Bearer <token>` / `X-User-Id`，企业账号另带 `X-Enterprise-Id` / `X-Tenant-Id`；来源 `resolveBackendAuthFromHost(host)`：`host.getEndpoint()` + `host.getToken()` + `host.getAccount()`）后转发到官方后端，返回 `{status, headers, body_b64}`（内联响应上限 640KB，超时 50s）。
+  - **凭据面反而更小**：脚本全程接触不到令牌。发现文件 `<configDir>/wbipc/endpoint.json`（`{endpoint, ticket}`，由主进程写入，官方设计就是给外部集成方读取的——源码注释明确"不打包客户端 SDK，接入方按协议实现即可"）；ticket（32B base64url）只做 HMAC-SHA256 双向证明（`wbipc-s`/`wbipc-c` 角色前缀 + 长度前缀 transcript），**从不上线**；path 校验禁止 `..`/绝对 URL/`?`，调用方指定不了 host。
+  - **协议**（换行分帧 JSON，帧限 1MiB，握手超时 5s）：`session_hello{protocol_min/max, client_nonce, ticket_id=sha256(ticket)前16hex, client}` → `session_challenge{protocol:1, server_nonce, server_proof}` → 客户端校验 server_proof 后回 `session_prove{client_proof}` → `session_hello_ack{connection_epoch, max_inflight:8, pipes}`。之后 JSON-RPC 2.0：`broker/GetPipe{pipe:"wb.request"}` → `{channel:"c:wb.request", methods:["http.fetch"]}`；调用须带 `mode:"call"`。params：`{method, path, query?, headers?(仅 content-type/accept), body_b64?}`。
+  - **实测坑（重要）**：Windows named pipe 在 `connect` 事件后**立即 write 会随机 EPIPE**（服务端实例未完全 accept），延迟 ~250ms 再写则 100% 稳定。脚本已内置该 workaround + 3 次连接重试。
+  - **首次实测**（2026-09-29 11:47，个人账号）：`checkin-status` → HTTP 200 code=0；`daily-checkin` → **code=0，credit=100，streak_days=11，签到成功**。11:56 幂等重跑正确输出 ALREADY。
+  - **日志/退出码约定**（`wbipc-checkin.js` stdout）：`WBIPC_RESULT=OK credit=<n> streak_days=<n>`（exit 0）/ `WBIPC_RESULT=ALREADY`（exit 0）/ `WBIPC_RESULT=FAIL code=<c> msg=<m>`（exit 1，如桌面端登录企业账号时）/ `WBIPC_ERROR=<REASON>`（exit 2，调用方回退通道B）。全程不落任何令牌。
+  - **`checkin.ps1` / `checkin.sh` 流程变化**：入口先探测 Node + `wbipc-checkin.js` + endpoint.json 三者齐备 → 走通道A；`WBIPC_ERROR` 或无输出时写一行「wbipc 通道不可用（…），回退本地令牌通道」并落回原 v1.0.4 流程。桌面端登录企业账号时，wbipc 通道会给出明确的"切换个人账号"提示（此时不再依赖本地 EntId 判断）。
+
+### 已知限制
+
+- wbipc 通道要求 **WorkBuddy 桌面端正在运行且已登录**（broker 随主进程存活；登出/切号会 `revokeAll` 撤销现有连接）。桌面端未运行时自动回退通道B（读本地令牌）；两者都不可用才报错。
+- `wb.request` 管道在"无可用登录态"时对 `GetPipe` 不可见（`E_PIPE_UNKNOWN`），脚本会归入 CONNECT_FAILED 类错误回退。
+- `checkin-status` 的 `today_checked_in` 在 wbipc 通道下仅做快速短路，幂等仍以 `daily-checkin` 响应 `msg` 为准（沿用 1.0.4 规则）。
+
+## [1.0.4] - 2026-09-29
+
+### 修复
+
+- **`code=10001` 被误判为「今日已签到」，企业账号用户连续多天误报"签到正常"、实际从未领取**（`checkin.ps1`）：
+  - **现象**：2026-09-28 ~ 09-29 连续 3 次运行（09:41 / 21:00 / 09:02）全部报告「今日已签到，无需重复领取（接口返回已签到）」，但用户实际未获得任何积分。
+  - **实测根因**（2026-09-29 用真实令牌抓取接口原始响应）：`daily-checkin` 返回 `HTTP 400 + {"code":10001,"msg":"企业账号不支持该操作"}`；同刻 `checkin-status` 返回 `active:false, today_checked_in:false, total_credits:0`。**10001 是被复用的通用业务拒绝码**：在 1.0.3 的个人账号验证矩阵里它表示"今日已签到"（幂等拒绝），但在企业账号场景下表示"企业账号不支持该操作"。1.0.2~1.0.3 把它硬编码为"已签到"，导致误报。
+  - **修复**：不再按 `code` 数值判定语义，改为解析响应 `msg`——仅当 msg 明确含"已签到"（或英文 already checked in）时才视为幂等跳过；`code=10001` 或 msg 含"企业账号"时报「该账号不支持签到活动」，且当本地登录态含 `enterpriseId` 时在日志中明确提示"当前登录态为企业账号，需个人账号登录"。同时保留 HTTP 400 但解析失败的原始响应摘要输出（截断至 120 字符，不含任何令牌）。
+  - **日志格式变化**：企业账号场景新增一行「签到未成功：该账号不支持签到活动 UNSUPPORTED（…）」，自动化任务可据此直接告警，不再静默"成功"。
+
+### 已知限制（重要，写给未来的自己）
+
+- **新版桌面端主登录态已被字段级加密，纯 Node 无法读取个人账号令牌**（2026-09-29 逆向实测）：
+  - 主文件 `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info` 中 `auth.accessToken` 变为 `{"$wbEncrypted":1,"envelope":"<base64>"}` 信封：`{"suite":1,"keyId":"<16hex>","nonce":"<12B b64>","authTag":"<16B b64>","ciphertext":"<b64>"}`，AES-256-GCM。
+  - 解密 key = `sha256(utf8(atRestSecretKey))`，`keyId = sha256(key).hex.slice(0,16)`；AAD 由 `WB-AAD\0` 域 + 格式 ID `WBEV1` + scheme `sym-v1` + suite + keyId + framing `field`(2) 逐字节拼接（逆向自 `packages/at-rest-crypto/dist/*`，构造方式已完全还原，见本条下方）。
+  - **但 `atRestSecretKey`（44 字符 canonical base64）只存在于桌面端 Electron fork 的原生模块**（主进程经 `workbuddyStorage.loggerGet()` 提供，再经 `daemon:credential-protection-bootstrap` IPC 下发给 sidecar），磁盘上无明文、无 DPAPI blob、注册表与凭据管理器均未命中；`~/.workbuddy/keyblob`（`{"version":1,"keyId":..,"slots":..}`）中 master key 也由同一 protectorKey 包裹，形成死循环。
+  - **结论**：当登录态只有企业账号明文快照、而个人账号令牌在加密主文件中时，本 skill 无法自动签到，只能如实报错并提示用户在桌面端用个人账号操作。若未来桌面端重新写出明文快照（历史行为：`workbuddy-desktop.<ts>.info`），现有明文分支仍会自动命中。
+  - AAD 构造参考（sym-v1 field 模式，供后续维护）：`concat("WB-AAD\0", [0x01], lenPref("WBEV1"), lenPref("sym-v1"), u32BE(suite), lenPref(keyId), [0x02], [0x00], [0x00])`；其中 lenPref = `u32BE(utf8Len) + utf8Bytes`。
+- **旁路获取密钥的全部路径已逐一验证并排除**（2026-09-29 下午，针对"桌面端实际登录个人账号"场景的完整收口）：
+  - **凭据保护引导架构**（逆向自 `codebuddy-headless.js` 模块 55647/12723/81479）：密钥传递是**单向推送**——主进程在 sidecar CLI 启动时注入 `CODEBUDDY_SIDECAR_READY_SOCKET/TOKEN/SESSION_ID` + `CODEBUDDY_SIDECAR_CREDENTIAL_BOOTSTRAP_SOCKET` + `WORKBUDDY_AT_REST_ENCRYPTION`（policy），CLI 在 bootstrap socket 上**被动监听**，主进程一次性连接并推送 `{version:1, sessionId, token, pid, bootstrap:{policy, symmetricKey:{key:<32B>}, …}}`（校验 sessionId/token/ppid），之后 `configureCredentialProtection()` 把 32 字节对称密钥装入 CLI 内存。密钥**从不落盘**，CLI 无法主动索取，外部进程无从窃取。bootstrap payload 结构（`decodeAtRestEncryptionBootstrap`）：`{version:1, policy:"fields"|"files"|"off", symmetricKey|symmetricUnavailable, userKey+developerPublicKey|asymmetricUnavailable}`。
+  - **本会话 CLI 是 standalone 模式**：当前进程环境实测四个 SIDECAR 变量与 `WORKBUDDY_AT_REST_ENCRYPTION` 全部缺失（`classifyStartupCredentialProtectionMode` 判定 standalone，凭据由主进程代管，CLI 的模型请求走 `CODEBUDDY_GATEWAY_*` 本地网关认证）。
+  - **PAC RPC**（`WORKBUDDY_PAC_RPC_SOCKET` named pipe）：HTTP-over-pipe 的**代理解析服务**（`GET /pac/resolve?url=...`，Bearer token 鉴权），与凭据无关。
+  - **service-proxy**（`CODEBUDDY_SERVICE_PROXY_URL=/internal/hooks/services/invoke` + `X-Service-Id`）：CLI→云端 `{gateway}/v2/service-proxy/<path>` 的 hook 服务转发链，服务列表由云端网关决定，非本地凭据出口。
+  - **LocalProbe**（桌面端主进程监听 `127.0.0.1:<port>`，netstat 定位）：唯一路由 `GET /workbuddy/probe`，仅返回 `{ok:true, app, version, platform}`，纯探测端点。
+  - **wbipc 管道**（`~/.workbuddy/wbipc/endpoint.json`）：主进程内部服务通道（endpoint + ticket），非凭据出口。
+  - **结论**：5.6.2 的凭据保护是完整闭环（内存→一次性 IPC→内存），纯外部脚本读取个人账号令牌在当前版本下**确定不可行**，不再有未验证的旁路。自动化签到恢复的条件只有两个：桌面端未来版本重新写出明文快照，或官方提供 CLI 凭据导出/官方自动化接口。
+
 ## [1.0.3] - 2026-08-12
 
 ### 修复
