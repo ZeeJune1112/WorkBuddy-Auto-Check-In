@@ -1,16 +1,35 @@
 # workbuddy-checkin
 
-> WorkBuddy（原 CodeBuddy）每日积分自动签到 Skill —— 全本机运行，无后端，令牌不落盘。
+> WorkBuddy（原 CodeBuddy）每日积分自动签到 —— 全本机运行，无后端，令牌不落盘。
 
 每天自动领取 WorkBuddy「Buddy 加油站」的 100 积分（连续第 7 天 1000 积分），再也不怕忘记签到断连。
 
+## 两条通道
+
+| 通道 | 触发条件 | 说明 |
+|------|----------|------|
+| **A：wbipc（优先，v1.0.5+）** | 桌面端正在运行并已登录 | 通过桌面端内置的 wbipc broker 转发请求，鉴权头由客户端主进程注入，**脚本全程接触不到令牌** |
+| B：本地令牌（回退） | 通道 A 不可用 | 读取本机登录态文件；仅对仍写出**明文**登录态的旧版本有效 |
+
+> 新版桌面端（2026-09 起）已把 `auth.accessToken` 改为 `$wbEncrypted` 字段级加密，密钥不落盘，
+> 通道 B 在新版上必然失败。**所以通道 A 是当前唯一可靠的方式**，桌面端保持登录即可。
+
 ## 它做了什么
 
-1. 读取本机 WorkBuddy 桌面端的登录态（v5.3.8+ 明文 JSON / 旧版 state.vscdb 自动探测）
-2. 调用腾讯官方签到接口 `copilot.tencent.com/billing/meter/daily-checkin`
+1. 读取桌面端写出的端点文件 `<configDir>/wbipc/endpoint.json`，与 wbipc broker 握手
+2. 经 `wb.request` 管道调用 `http.fetch`：查询签到状态 → 未签到则领取
 3. 幂等：今日已签到自动跳过，支持一天多时间点补签
 
-**不做什么**：不点 GUI 按钮（Electron `isTrusted` 过滤使模拟点击无效）、不上传令牌给第三方、不写入日志。
+**不做什么**：不点 GUI 按钮（Electron `isTrusted` 过滤使模拟点击无效）、不上传令牌给第三方、不把令牌写入日志。
+
+## 前提
+
+- WorkBuddy 桌面端已安装并**保持运行**、已登录（wbipc broker 随主进程存活，退出即失效）
+- 仅支持**个人账号**；企业账号接口会返回「不支持该操作」
+- Node.js 20+（[nodejs.org](https://nodejs.org)）
+
+> 通道 A 不可用时会自动回退通道 B，日志里会留一行「wbipc 通道不可用（…），回退本地令牌通道」。
+
 
 ## 最简方式：WorkBuddy 内置 Skill 目录（推荐小白）
 
@@ -18,13 +37,19 @@
 
 ### 1. 准备本地 skill 目录
 
-在电脑上新建一个文件夹（例如 `D:\workspace\workbuddy\签到自动任务`），把本仓库的 `SKILL.md` 复制进去。
+把**整个仓库**复制到一个新文件夹（例如 `D:\workspace\workbuddy\签到自动任务`）。不要只拷 `SKILL.md`——
+`SKILL.md` 里的流程会调用 `scripts/` 下的脚本，缺了脚本就跑不起来。
 
 ![步骤1：新建本地 skill 目录](images/step1.png)
 
 ```
 签到自动任务/
-└── SKILL.md
+├── SKILL.md
+└── scripts/
+    ├── wbipc-checkin.js
+    ├── checkin.ps1
+    ├── checkin.sh
+    └── ...
 ```
 
 ### 2. 在 WorkBuddy 里新建任务
@@ -60,29 +85,24 @@ WorkBuddy 会读取目录里的 `SKILL.md`，理解签到逻辑，并自动创�
 ```
 ✅ Buddy 加油站每日积分领取成功
 - 领取结果：credit=100，连续签到 streak_days=5（连续第 5 天）
-- 空闲检测：空闲 18 秒、CPU 15.1%、无媒体播放 → 通过
-- 幂等保障：若返回 code=10001（今日已签到）会自动跳过
+- 通道：wbipc（桌面端运行中，令牌全程未离开客户端）
+- 幂等保障：今日已领取会自动跳过
 ```
 
 > 如果当天已经手动领取过，它会返回「今日已签到，无需重复领取」，不会重复扣分/加分。
 
 ## 快速开始（命令行方式）
 
-如果你更喜欢用脚本/命令行，或者想先手动验证一次：
-
-### 前提
-
-- 已安装并**登录** WorkBuddy 桌面端（[官网下载](https://www.codebuddy.cn/work/)）
-- 系统已安装 Node.js 20+（[nodejs.org](https://nodejs.org)）
+如果你更喜欢用脚本/命令行，或者想先手动验证一次，按上面的「前提」准备好环境后：
 
 ### Windows（PowerShell）
 
 ```powershell
 # 1. 克隆仓库
-git clone https://github.com/Coco-katarina/workbuddy-checkin.git
-cd workbuddy-checkin
+git clone https://github.com/ZeeJune1112/WorkBuddy-Auto-Check-In.git
+cd WorkBuddy-Auto-Check-In
 
-# 2. 环境检查（验证令牌链路）
+# 2. 环境检查
 powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
 
 # 3. 立即签到
@@ -103,9 +123,12 @@ bash scripts/setup.sh
 bash scripts/checkin.sh
 ```
 
-预期输出：
-- `签到成功！领取 OK credit=100 streak_days=N` → 当日领取成功
-- `今日已签到，无需重复领取` → 已领过，幂等结束
+预期输出（v1.0.5+）：
+
+- `签到成功！领取 credit=100 streak_days=N（wbipc 通道）` → 当日领取成功
+- `今日已签到，无需重复领取（wbipc 通道）` → 已领过，幂等结束
+- `签到未成功：该账号不支持签到活动…` → 当前登录的是企业账号
+- `wbipc 通道不可用（…），回退本地令牌通道` → 桌面端未运行或未登录，走了回退通道
 
 ## 设置定时任务
 
@@ -134,13 +157,13 @@ crontab -e
 
 | 项目 | 说明 |
 |------|------|
-| 令牌存储 | 仅内存使用，管道即时消费，**不落盘、不回显、不写日志** |
+| 令牌存储 | 通道 A **完全不接触令牌**（鉴权头由桌面端主进程注入）；通道 B 仅内存使用，管道即时消费，**不落盘、不回显、不写日志** |
 | 网络访问 | 仅 `copilot.tencent.com` 官方接口，**不访问任何第三方** |
 | 日志内容 | 仅积分 / 连续天数 / 成功失败，**绝不含令牌** |
-| 系统修改 | 只读登录态文件，**不修改 WorkBuddy 本体** |
+| 系统修改 | 只读登录态文件与本地命名管道，**不修改 WorkBuddy 本体** |
 | 自动安装 | Electron 下载默认关闭，需显式 `WB_CHECKIN_AUTO_INSTALL_ELECTRON=1` |
 
-> **凭据即账号密码**：解密的 `accessToken` 等同你的 WorkBuddy 账号密码。切勿将日志、脚本输出粘贴分享或提交到仓库。
+> **凭据即账号密码**：通道 B 解出的 `accessToken` 等同你的 WorkBuddy 账号密码。切勿将日志、脚本输出粘贴分享或提交到仓库。
 
 ## 文件结构
 
@@ -149,9 +172,10 @@ workbuddy-checkin/
 ├── SKILL.md                      # Skill 规范文档
 ├── CHANGELOG.md                  # 变更日志
 ├── scripts/
-│   ├── decrypt-token.js          # 令牌读取（新版明文 Node / 旧版 Electron safeStorage）
-│   ├── checkin.sh                # macOS / Linux / Git Bash
-│   ├── checkin.ps1               # Windows PowerShell
+│   ├── wbipc-checkin.js          # 通道 A：经桌面端 wbipc broker 签到（v1.0.5+）
+│   ├── decrypt-token.js          # 通道 B：令牌读取（明文 Node / Electron safeStorage）
+│   ├── checkin.sh                # macOS / Linux / Git Bash 入口
+│   ├── checkin.ps1               # Windows PowerShell 入口
 │   ├── setup.sh                  # macOS / Linux 环境检查
 │   └── setup.ps1                 # Windows 环境检查
 └── references/
@@ -162,11 +186,12 @@ workbuddy-checkin/
 
 | 现象 | 原因 | 处理 |
 |------|------|------|
+| `wbipc 通道不可用（…），回退本地令牌通道` | 桌面端未运行 / 未登录 / 登录态被撤销 | 启动并登录桌面端后重跑 |
+| `签到未成功：该账号不支持签到活动` | 当前登录的是**企业账号** | 在桌面端切换个人账号 |
+| 新版桌面端报「获取令牌失败」 | `accessToken` 已是 `$wbEncrypted` 加密，通道 B 无法解密 | 用 v1.0.5+，走 wbipc 通道 |
+| 返回 `code=10001` 但没领到积分 | 10001 是通用业务拒绝码，**不等于**“已签到” | 看响应 `msg` 文案区分（v1.0.4+ 已改为按 msg 判定） |
 | PS 解析报错（字符串缺少终止符） | 无 BOM 被 GBK 误读 | 给 ps1 加 UTF-8 BOM（本仓库已含） |
-| HTTP 401 | 令牌过期 / 读到旧版 state.vscdb | 打开 WorkBuddy 刷新登录态；确认用 v1.0.3+ |
-| 幂等场景报 PARSE_ERR | ConvertFrom-Json 解析 400 响应失败 | 加 code=10001 前置判断（本仓库已修复） |
-| 找不到登录态 | WorkBuddy 未登录 | 打开桌面端登录一次 |
-| Windows 持续 401 | 旧版只探 %APPDATA%，实际在 %LOCALAPPDATA% | 用 v1.0.3+（本仓库已修复） |
+| `HTTP 401` | 登录态过期 | 打开 WorkBuddy 刷新登录态后重试 |
 
 ## 致谢
 
