@@ -102,10 +102,7 @@ WorkBuddy 会读取目录里的 `SKILL.md`，理解签到逻辑，并自动创�
 git clone https://github.com/ZeeJune1112/WorkBuddy-Auto-Check-In.git
 cd WorkBuddy-Auto-Check-In
 
-# 2. 环境检查
-powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
-
-# 3. 立即签到
+# 2. 立即签到
 powershell -ExecutionPolicy Bypass -File scripts\checkin.ps1
 ```
 
@@ -113,13 +110,10 @@ powershell -ExecutionPolicy Bypass -File scripts\checkin.ps1
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/Coco-katarina/workbuddy-checkin.git
-cd workbuddy-checkin
+git clone https://github.com/ZeeJune1112/WorkBuddy-Auto-Check-In.git
+cd WorkBuddy-Auto-Check-In
 
-# 2. 环境检查
-bash scripts/setup.sh
-
-# 3. 立即签到
+# 2. 立即签到
 bash scripts/checkin.sh
 ```
 
@@ -130,6 +124,24 @@ bash scripts/checkin.sh
 - `签到未成功：该账号不支持签到活动…` → 当前登录的是企业账号
 - `wbipc 通道不可用（…），回退本地令牌通道` → 桌面端未运行或未登录，走了回退通道
 
+### 可选：分别验证两条通道
+
+```bash
+# 只验证通道 A（wbipc）：直接跑，看输出的 WBIPC_RESULT
+node scripts/wbipc-checkin.js
+#   WBIPC_RESULT=OK credit=100 streak_days=N  → 通道 A 正常
+#   WBIPC_RESULT=ALREADY                     → 今日已领过
+#   WBIPC_RESULT=FAIL code=... msg=...        → 业务拒绝（如企业账号）
+#   WBIPC_ERROR=...                          → 通道 A 不可用，会回退通道 B
+
+# 只验证通道 B（本地令牌链路）：setup 脚本只检查这一条，不检查 wbipc
+bash scripts/setup.sh          # macOS / Linux
+powershell -ExecutionPolicy Bypass -File scripts\setup.ps1   # Windows
+```
+
+> 新版桌面端上 `setup` 报「获取令牌失败」是**预期行为**——令牌已加密，通道 B 本就不可用；
+> 只要 `node scripts/wbipc-checkin.js` 能出结果，签到就没问题。
+
 ## 设置定时任务
 
 电脑非全天开机时，建议配置多个时间点补签（脚本幂等，重复运行无副作用）。推荐 `09:00 / 12:00 / 15:00 / 18:00 / 21:00` 各尝试一次。
@@ -137,21 +149,28 @@ bash scripts/checkin.sh
 ### Windows（任务计划程序）
 
 ```powershell
-schtasks /Create /TN WorkBuddyCheckin_09 /TR "powershell -ExecutionPolicy Bypass -File C:\path\to\checkin.ps1" /SC DAILY /ST 09:00 /F
-schtasks /Create /TN WorkBuddyCheckin_12 /TR "powershell -ExecutionPolicy Bypass -File C:\path\to\checkin.ps1" /SC DAILY /ST 12:00 /F
+schtasks /Create /TN WorkBuddyCheckin_09 /TR "powershell -ExecutionPolicy Bypass -File C:\path\to\WorkBuddy-Auto-Check-In\scripts\checkin.ps1" /SC DAILY /ST 09:00 /F
+schtasks /Create /TN WorkBuddyCheckin_12 /TR "powershell -ExecutionPolicy Bypass -File C:\path\to\WorkBuddy-Auto-Check-In\scripts\checkin.ps1" /SC DAILY /ST 12:00 /F
 ```
+
+> 注意路径里要带 `scripts\`，直接指向 `checkin.ps1`，别指到仓库根。
+> 任务计划程序需在**用户会话**中运行（默认即是），且桌面端当时已登录，wbipc 通道才可用。
 
 ### macOS / Linux（crontab）
 
 ```bash
 crontab -e
-# 添加（替换实际路径）
-0 9,12,15,18,21 * * * /path/to/checkin.sh >> /path/to/logs/checkin.log 2>&1
+# 添加（替换成实际仓库路径）
+0 9,12,15,18,21 * * * bash /path/to/WorkBuddy-Auto-Check-In/scripts/checkin.sh
 ```
+
+> 脚本会自己写入 `<仓库>/logs/checkin.log`，**不需要再 `>>` 重定向**，否则日志会重复两份。
 
 ### macOS launchd（长期后台）
 
-创建 `~/Library/LaunchAgents/com.user.workbuddy-checkin.plist`，`StartCalendarInterval` 用数组配置多时间点，详见 [SKILL.md](SKILL.md)。
+创建 `~/Library/LaunchAgents/com.user.workbuddy-checkin.plist`，`ProgramArguments` 指向
+`/path/to/WorkBuddy-Auto-Check-In/scripts/checkin.sh`，`StartCalendarInterval` 用数组配置多时间点，
+详见 [SKILL.md](SKILL.md)。
 
 ## 安全说明
 
@@ -168,7 +187,7 @@ crontab -e
 ## 文件结构
 
 ```
-workbuddy-checkin/
+WorkBuddy-Auto-Check-In/
 ├── SKILL.md                      # Skill 规范文档
 ├── CHANGELOG.md                  # 变更日志
 ├── scripts/
@@ -196,9 +215,14 @@ workbuddy-checkin/
 ## 致谢
 
 - 原作者：[cat-xierluo](https://github.com/cat-xierluo/legal-skills) —— 原始 skill v1.0.3
-- 本仓库在原版基础上做了 Windows 适配修复：
-  1. `checkin.ps1` / `setup.ps1` 添加 UTF-8 BOM（解决 PowerShell 5.1 中文 GBK 误读）
-  2. `checkin.ps1` 幂等场景 `code=10001` 前置判断（修复 ConvertFrom-Json 解析 400 响应的 PARSE_ERR bug）
+
+本仓库在原版基础上的改动：
+
+1. **Windows 适配**：`checkin.ps1` / `setup.ps1` 加 UTF-8 BOM（解决 PowerShell 5.1 中文 GBK 误读）；
+   登录态路径优先 `%LOCALAPPDATA%`（修复持续 401）
+2. **v1.0.4**：不再按 `code=10001` 判定语义，改按响应 `msg`（修复企业账号被误报「今日已签到」）
+3. **v1.0.5**：新增 wbipc 通道——新版桌面端把 `accessToken` 改为字段级加密后，
+   这是唯一不依赖令牌解密的路径
 
 ## License
 
